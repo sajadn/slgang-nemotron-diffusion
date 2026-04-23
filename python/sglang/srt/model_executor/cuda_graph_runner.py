@@ -589,6 +589,7 @@ class CudaGraphRunner:
 
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
+        self.dllm_causal = False
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
@@ -690,7 +691,14 @@ class CudaGraphRunner:
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-        # Capture
+        # Capture (can be deferred for DLLM dual-weight baking —
+        # hooks must be set before the first capture).
+        if not getattr(model_runner.server_args, "_defer_cuda_graph_capture", False):
+            self.init_capture()
+
+    def init_capture(self):
+        """Run the actual CUDA graph capture.  Separated from __init__ so that
+        callers (e.g. DLLM dual-weight LoRA) can set hooks first."""
         try:
             with model_capture_mode():
                 self.capture()
@@ -726,6 +734,13 @@ class CudaGraphRunner:
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
+
+        # For DLLM models, only DLLM_EXTEND passes use the CUDA graph.
+        # EXTEND (prompt-caching) and other modes fall through to eager.
+        if self.is_dllm and not forward_batch.forward_mode.is_dllm_extend():
+            return False
+
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -860,6 +875,10 @@ class CudaGraphRunner:
                         num_tokens=bs * self.num_tokens_per_bs,
                         tp_group=self.model_runner.tp_group,
                     ) as forward:
+                        # Hook: swap to draft/fused weights before non-causal capture
+                        pre_draft = getattr(self, "_dllm_pre_draft_hook", None)
+                        if pre_draft:
+                            pre_draft()
                         (
                             graph,
                             output_buffers,
@@ -867,6 +886,24 @@ class CudaGraphRunner:
                         key = _default_make_graph_key(bs, stream_idx, variant_label)
                         self.graphs[key] = graph
                         self.output_buffers[key] = output_buffers
+
+                        # DLLM: capture a second graph with causal=True for the
+                        # KV-update pass (1 per block, ~3% of forward passes).
+                        if self.is_dllm:
+                            # Hook: swap to base/verify weights before causal capture
+                            pre_verify = getattr(self, "_dllm_pre_verify_hook", None)
+                            if pre_verify:
+                                pre_verify()
+                            causal_graph, causal_output = self.capture_one_batch_size(
+                                bs, forward, stream_idx, dllm_causal=True
+                            )
+                            causal_key = (
+                                f"causal_{bs}"
+                                if stream_idx is None
+                                else f"causal_{stream_idx}_{bs}"
+                            )
+                            self.graphs[causal_key] = causal_graph
+                            self.output_buffers[causal_key] = causal_output
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -931,7 +968,11 @@ class CudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        dllm_causal: bool = False,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
@@ -1079,12 +1120,18 @@ class CudaGraphRunner:
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
+        if dllm_causal:
+            forward_batch.dllm_causal_kv_update = True
+
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
+        capture_kwargs = {}
+        if dllm_causal:
+            capture_kwargs["dllm_causal"] = True
         attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
@@ -1093,6 +1140,7 @@ class CudaGraphRunner:
             encoder_lens,
             forward_batch.forward_mode,
             forward_batch.spec_info,
+            **capture_kwargs,
         )
 
         # Run and capture
@@ -1240,6 +1288,10 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
+        dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
+        replay_kwargs = {}
+        if dllm_causal:
+            replay_kwargs["dllm_causal"] = True
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1249,12 +1301,14 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
+            **replay_kwargs,
         )
 
         # Store fields
         self.raw_bs = raw_bs
         self.raw_num_token = raw_num_token
         self.bs = bs
+        self.dllm_causal = dllm_causal
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1286,6 +1340,8 @@ class CudaGraphRunner:
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
+        if self.dllm_causal:
+            graph_key = f"causal_{graph_key}"
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
