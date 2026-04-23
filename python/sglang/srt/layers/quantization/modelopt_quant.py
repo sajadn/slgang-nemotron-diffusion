@@ -28,7 +28,11 @@ from sglang.srt.layers.moe.utils import (
     is_flashinfer_cutedsl_v1_path,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
+from sglang.srt.layers.parameter import (
+    BasevLLMParameter,
+    ModelWeightParameter,
+    PerTensorScaleParameter,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -72,15 +76,17 @@ if TYPE_CHECKING:
 
 fp4_quantize = None
 try:
-    if is_sm120_supported():
-        try:
-            from flashinfer import fp4_quantize
-        except ImportError:
-            from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
-    else:
-        from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
+    # Prefer flashinfer fp4_quantize when available: it produces the correct
+    # swizzled scale layout (is_sf_swizzled_layout=True by default) expected
+    # by the flashinfer_cutlass and flashinfer_cudnn GEMM kernels on both
+    # SM100 (B200) and SM120+.
+    # Fall back to JIT scaled_fp4_quant only when flashinfer is unavailable.
+    from flashinfer import fp4_quantize
 except ImportError:
-    fp4_quantize = None
+    try:
+        from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
+    except ImportError:
+        fp4_quantize = None
 
 try:
     from flashinfer import mm_fp4 as flashinfer_fp4_gemm
@@ -1366,6 +1372,15 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
 
         layer.register_parameter("weight_scale", weight_scale)
 
+        # AWQ checkpoints may include pre_quant_scale (per-input-channel activation
+        # scaling).  Initialize to ones so layers without it work identically.
+        # Using plain Parameter so default_weight_loader handles it via data.copy_().
+        pre_quant_scale = Parameter(
+            torch.ones(input_size_per_partition, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        layer.register_parameter("pre_quant_scale", pre_quant_scale)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         input_scale_2 = layer.input_scale.max().to(torch.float32)
         weight_scale_2 = layer.weight_scale_2.max().to(torch.float32)
@@ -1451,8 +1466,28 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         batches, rows, cols = padded_scales.shape
         assert rows % 128 == 0
         assert cols % 4 == 0
-        padded_scales = padded_scales.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
-        padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
+        # Select scale layout based on backend requirements:
+        #
+        # flashinfer_cutlass (SM100/SM110): natural row-major [N, K_sf] layout.
+        #   The cutlass kernel reads scales from natural padded layout directly.
+        #   No permutation needed. Verified: do_shuffle=False gives cosine=0.99.
+        #
+        # flashinfer_cudnn (b_descale F8_128x4): 4-elem tiles in K_sf, 128-elem in N
+        #   offset = (k//4 * N//128 + n//128)*512 + k%4*128 + n%128
+        #   reshape [B, N//128, 128, K_sf//4, 4] → permute (0, 3, 1, 4, 2)
+        #
+        # JIT CUTLASS: proprietary SGLang/JIT format.
+        _backend = get_fp4_gemm_runner_backend()
+        if enable_flashinfer_fp4_gemm and not _backend.is_cutlass():
+            if _backend.is_flashinfer_cudnn():
+                # cuDNN b_descale F8_128x4 format
+                padded_scales = padded_scales.reshape(batches, rows // 128, 128, cols // 4, 4)
+                padded_scales = padded_scales.permute((0, 3, 1, 4, 2))
+            # else: flashinfer_cutlass uses natural row-major layout (no permutation)
+        else:
+            # JIT CUTLASS: proprietary SGLang/JIT format
+            padded_scales = padded_scales.reshape(batches, rows // 128, 4, 32, cols // 4, 4)
+            padded_scales = padded_scales.permute((0, 1, 4, 3, 2, 5))
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
             padded_scales.reshape(M_padded, K_padded)
@@ -1474,6 +1509,11 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         output_size = layer.output_size_per_partition
         w_n, _ = layer.weight.shape
         output_shape = [x_m, output_size]
+
+        # Apply AWQ pre_quant_scale: per-input-channel activation scaling.
+        # AWQ bakes W*s into weights; inference divides activations by s to compensate.
+        # Always registered (ones for non-AWQ layers), so always safe to apply.
+        x = x / layer.pre_quant_scale.to(x.dtype)
 
         # Quantize BF16 or FP16 to (FP4 and interleaved block scale)
         x_fp4, x_scale_interleaved = fp4_quantize(x, layer.input_scale_inv)

@@ -4,7 +4,7 @@ import logging
 from enum import Enum
 from typing import TYPE_CHECKING
 
-from sglang.srt.utils.common import is_sm120_supported
+from sglang.srt.utils.common import is_sm100_supported, is_sm120_supported
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -71,6 +71,15 @@ def initialize_fp4_gemm_config(server_args: ServerArgs) -> None:
             logger.info(
                 "SM120 (Blackwell) detected: auto-selecting "
                 "fp4-gemm-backend=flashinfer_cudnn"
+            )
+        elif is_sm100_supported():
+            # flashinfer_cutlass gives wrong results on SM100 (B200).
+            # The cutlass backend requires a different weight layout than what
+            # we produce; trtllm with shuffle_matrix_a produces correct outputs.
+            backend = "flashinfer_trtllm"
+            logger.info(
+                "SM100 (B200) detected: auto-selecting "
+                "fp4-gemm-backend=flashinfer_trtllm"
             )
         else:
             backend = "flashinfer_cutlass"

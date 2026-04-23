@@ -28,6 +28,7 @@ struct KernelConfigM128 {
   using EpilogueTile = Shape<_128, _64>;  // Avoid register spilling
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
   using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100;
+  using TileScheduler = void;
   const static dim3 preferred_cluster;
   const static dim3 fallback_cluster;
 };
@@ -45,6 +46,7 @@ struct KernelConfigM256 {
   using EpilogueTile = Shape<_128, _64>;  // Avoid register spilling
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
   using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100;
+  using TileScheduler = void;
   const static dim3 preferred_cluster;
   const static dim3 fallback_cluster;
 };
@@ -57,6 +59,7 @@ const dim3 KernelConfigM256<T>::fallback_cluster(2, 1, 1);
 template <typename T>
 struct KernelConfigDefault {
   using OutputType = T;
+  using TileScheduler = void;
   using MmaTileShape = Shape<_256, _256, _256>;
   using ClusterShape = Shape<int, int, _1>;
   using EpilogueTile = Shape<_128, _64>;  // Avoid register spilling
@@ -74,6 +77,7 @@ const dim3 KernelConfigDefault<T>::fallback_cluster(2, 1, 1);
 template <typename T>
 struct KernelConfigLargeM {
   using OutputType = T;
+  using TileScheduler = void;
   using MmaTileShape = Shape<_256, _256, _256>;
   using ClusterShape = Shape<int, int, _1>;
   using EpilogueTile = Shape<_128, _64>;
@@ -89,6 +93,7 @@ const dim3 KernelConfigLargeM<T>::fallback_cluster(1, 2, 1);
 
 struct KernelConfigFp32 {
   using OutputType = float;
+  using TileScheduler = void;
   using MmaTileShape = Shape<_128, _128, _256>;
   using ClusterShape = Shape<int, int, _1>;
   using EpilogueTile = cutlass::epilogue::collective::EpilogueTileAuto;
@@ -129,6 +134,7 @@ struct Fp4GemmSm100 {
   using EpilogueTile = typename KernelConfig::EpilogueTile;
   using EpilogueSchedule = typename KernelConfig::EpilogueSchedule;
   using MainloopSchedule = typename KernelConfig::MainloopSchedule;
+  using TileScheduler = typename KernelConfig::TileScheduler;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag,
@@ -164,7 +170,7 @@ struct Fp4GemmSm100 {
       MainloopSchedule>::CollectiveOp;
 
   using GemmKernel =
-      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, void>;
+      cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
   using StrideA = typename Gemm::GemmKernel::StrideA;
   using LayoutA = decltype(cute::make_layout(make_shape(0, 0, 0), StrideA{}));
