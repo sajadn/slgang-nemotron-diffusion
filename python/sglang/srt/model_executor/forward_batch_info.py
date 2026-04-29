@@ -444,6 +444,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Set by FastDiffuser.run() before the final forward, cleared afterwards.
     dllm_causal_kv_update: bool = False
 
+    # For DLLM AR algorithm: when True, the forward uses DECODE mode (optimized
+    # single-token decode attention kernel) instead of DLLM_EXTEND with prefill
+    # kernel. Gives ~50% throughput improvement for AR mode.
+    dllm_ar_mode: bool = False
+
     @classmethod
     def init_new(
         cls,
