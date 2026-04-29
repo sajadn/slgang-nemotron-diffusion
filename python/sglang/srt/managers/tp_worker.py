@@ -340,6 +340,16 @@ class TpModelWorker(BaseTpWorker):
     def _init_model_runner(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
+        # If DLLM algorithm has a lora_path, defer CUDA graph capture so
+        # LinearSpec can set weight-swap hooks before the first capture.
+        if self.server_args.dllm_algorithm_config:
+            import yaml
+
+            with open(self.server_args.dllm_algorithm_config) as f:
+                _cfg = yaml.safe_load(f) or {}
+            if _cfg.get("lora_path"):
+                self.server_args._defer_cuda_graph_capture = True
+
         self._model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,

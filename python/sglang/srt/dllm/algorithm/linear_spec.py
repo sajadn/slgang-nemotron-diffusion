@@ -26,8 +26,10 @@ Usage:
     stats_file: null
 """
 
+import json as _json
 import logging
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -65,6 +67,18 @@ class LinearSpec(DllmAlgorithm):
         self._stats_file: Optional[str] = cfg.get("stats_file", None)
         self._stats_forward_passes: int = 0
 
+        # LoRA: pre-compute fused deltas, bake into CUDA graphs or swap at runtime.
+        # lora_mode: "draft_only" (default) — LoRA on draft pass only.
+        #            "both"       — LoRA on both draft and verify passes (matches HF).
+        #
+        # _lora_deltas stores (param, delta_bf16, module) triples.
+        # The module ref is needed for FP8 mode to access weight_scale.
+        self._lora_path: Optional[str] = cfg.get("lora_path", None)
+        self._lora_mode: str = cfg.get("lora_mode", "draft_only")
+        self._lora_deltas: Optional[List[Tuple[torch.nn.Parameter, torch.Tensor, torch.nn.Module]]] = None
+        self._dual_weights: Optional[List[Tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]]] = None
+        self._graphs_baked: bool = False
+
         # Profiling accumulators (wall-clock with cuda sync, zero-overhead when disabled)
         self._profile: bool = cfg.get("profile", False)
         self._prof_n: int = 0
@@ -78,10 +92,159 @@ class LinearSpec(DllmAlgorithm):
         self._prof_last_return: float = 0.0  # time.perf_counter at last return
 
         logger.info(
-            "LinearSpec: block_size=%d  causal_context=%s",
+            "LinearSpec: block_size=%d  causal_context=%s  lora=%s  lora_mode=%s",
             self.block_size,
             self.causal_context,
+            self._lora_path or "none",
+            self._lora_mode,
         )
+
+    def setup(self, model_runner: ModelRunner) -> None:
+        """Called once at startup (before any requests) to load LoRA and
+        optionally bake dual weights into CUDA graphs."""
+        if self._lora_path is None:
+            return
+        self._load_lora_deltas(model_runner)
+        if self._lora_deltas and model_runner.graph_runner is not None:
+            self._bake_dual_weights_into_graphs(model_runner)
+
+    def _bake_dual_weights_into_graphs(self, model_runner: ModelRunner) -> None:
+        """Build draft weight copies from LoRA deltas, set CUDA graph hooks,
+        and trigger deferred capture.
+
+        After this, draft CUDA graphs read from fused (base+LoRA) memory and
+        verify graphs read from the original param.data — zero per-block overhead.
+        Only one extra copy per LoRA-targeted param (draft_copy), not two.
+
+        FP8 mode: weights are FP8-quantized and transposed.  We dequantize to
+        BF16, add the LoRA delta, and re-quantize.  Both weight AND weight_scale
+        parameters get dual entries so the GEMM stays correct.
+        """
+        dual: List[Tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]] = []
+
+        # Detect FP8: check if the first LoRA-targeted weight is FP8
+        first_param = self._lora_deltas[0][0]
+        is_fp8 = first_param.data.dtype in (
+            torch.float8_e4m3fn,
+            getattr(torch, "float8_e4m3fnuz", torch.float8_e4m3fn),
+        )
+
+        if is_fp8:
+            from sglang.srt.layers.quantization.fp8_kernel import (
+                per_token_group_quant_fp8,
+            )
+            logger.info("LinearSpec: FP8 mode — dequant+requant for draft weights")
+
+        for param, delta, module in self._lora_deltas:
+            base_ref = param.data  # reuse original tensor, no clone
+
+            if is_fp8:
+                # --- FP8 path: dequant → add delta → requant ---
+                scale_param = module.weight_scale
+                # Stored layout: weight (K, N) FP8, scale (groups, N) float
+                # Original layout: weight (N, K), scale (N, groups)
+                qw_orig = base_ref.t().float()          # (N, K) float32
+                sc_orig = scale_param.data.t().float()   # (N, groups) float32
+                base_bf16 = (qw_orig * sc_orig).to(torch.bfloat16)  # dequant
+
+                draft_bf16 = base_bf16 + delta.to(base_bf16.device, torch.bfloat16)
+
+                K = draft_bf16.shape[-1]
+                draft_fp8, draft_sc = per_token_group_quant_fp8(draft_bf16, K)
+                # Store in same layout as original:
+                # weight: qweight.t() — column-major (K, N) view (no .contiguous()!)
+                # scale: weight_scale.t().contiguous() — row-major (groups, N)
+                draft_fp8_stored = draft_fp8.t()
+                draft_sc_stored = draft_sc.t().contiguous()
+
+                dual.append((param, base_ref, draft_fp8_stored))
+                dual.append((scale_param, scale_param.data, draft_sc_stored))
+            else:
+                draft_copy = base_ref + delta
+                dual.append((param, base_ref, draft_copy))
+
+        self._dual_weights = dual
+
+        total_mb = sum(d.numel() * d.element_size()
+                       for _, _, d in dual) / 1e6
+        logger.info("LinearSpec dual weights built from LoRA: %d params, %.1f MB extra",
+                     len(dual), total_mb)
+
+        def set_lora():
+            for p, _, d in self._dual_weights:
+                p.data = d
+
+        def set_base():
+            for p, b, _ in self._dual_weights:
+                p.data = b
+
+        gr = model_runner.graph_runner
+        gr._dllm_pre_draft_hook = set_lora
+        # "both" mode: verify graph also bakes in LoRA weights.
+        # "draft_only": verify graph uses base weights.
+        gr._dllm_pre_verify_hook = set_lora if self._lora_mode == "both" else set_base
+
+        if getattr(model_runner.server_args, "_defer_cuda_graph_capture", False):
+            logger.info("LinearSpec: capturing CUDA graphs with baked-in LoRA weights...")
+            gr.init_capture()
+            self._graphs_baked = True
+            # Free deltas — no longer needed once graphs are baked
+            self._lora_deltas = None
+            logger.info("LinearSpec: CUDA graph capture done (LoRA baked)")
+
+    def _load_lora_deltas(self, model_runner: ModelRunner) -> None:
+        """Load PEFT LoRA checkpoint and compute fused weight deltas (once)."""
+        if self._lora_deltas is not None or self._lora_path is None:
+            return
+        lora_dir = Path(self._lora_path)
+        with open(lora_dir / "adapter_config.json") as f:
+            acfg = _json.load(f)
+        r, alpha = acfg["r"], acfg["lora_alpha"]
+        scale = alpha / r
+
+        from safetensors.torch import load_file
+        lora_weights = load_file(str(lora_dir / "adapter_model.safetensors"))
+
+        layer_projs: Dict[int, Dict[str, Dict[str, torch.Tensor]]] = {}
+        for key, tensor in lora_weights.items():
+            parts = key.split(".")
+            layer_idx = int(parts[parts.index("layers") + 1])
+            # Determine module group and projection name
+            if "self_attn" in parts:
+                proj = parts[parts.index("self_attn") + 1]
+            elif "mlp" in parts:
+                proj = parts[parts.index("mlp") + 1]
+            else:
+                continue
+            ab = parts[-2]
+            layer_projs.setdefault(layer_idx, {}).setdefault(proj, {})[ab] = tensor
+
+        model = model_runner.model
+        deltas: List[Tuple[torch.nn.Parameter, torch.Tensor, torch.nn.Module]] = []
+        for layer_idx, projs in sorted(layer_projs.items()):
+            layer = model.model.layers[layer_idx]
+            if any(p in projs for p in ("q_proj", "k_proj", "v_proj")):
+                qkv_parts = []
+                for proj in ("q_proj", "k_proj", "v_proj"):
+                    if proj in projs:
+                        A = projs[proj]["lora_A"]
+                        B = projs[proj]["lora_B"]
+                        qkv_parts.append((B @ A) * scale)
+                    else:
+                        raise ValueError(f"Missing {proj} in LoRA layer {layer_idx}")
+                qkv_delta = torch.cat(qkv_parts, dim=0)
+                param = layer.self_attn.qkv_proj.weight
+                deltas.append((param, qkv_delta.to(param.dtype).to(param.device), layer.self_attn.qkv_proj))
+            if "o_proj" in projs:
+                A = projs["o_proj"]["lora_A"]
+                B = projs["o_proj"]["lora_B"]
+                o_delta = (B @ A) * scale
+                param = layer.self_attn.o_proj.weight
+                deltas.append((param, o_delta.to(param.dtype).to(param.device), layer.self_attn.o_proj))
+
+        self._lora_deltas = deltas
+        total_mb = sum(d.numel() * d.element_size() for _, d, _ in deltas) / 1e6
+        logger.info("LinearSpec LoRA loaded: %d delta tensors, %.1f MB", len(deltas), total_mb)
 
     def _get_eos_id(self, model_runner: ModelRunner) -> Optional[int]:
         if self._eos_token_id is None:
@@ -160,8 +323,11 @@ class LinearSpec(DllmAlgorithm):
                     has_seed[b] = True
 
         # ----------------------------------------------------------------
-        # DRAFT pass (bidirectional attention)
+        # DRAFT pass (bidirectional attention) — with optional LoRA
         # ----------------------------------------------------------------
+        # Lazy init for non-baked path (when setup() wasn't called).
+        self._load_lora_deltas(model_runner)
+
         if self._profile:
             torch.cuda.synchronize()
             _t0 = time.perf_counter()
@@ -169,7 +335,18 @@ class LinearSpec(DllmAlgorithm):
                 self._prof_scheduler += _t_entry - self._prof_last_return
             self._prof_pre_draft += _t0 - _t_entry
 
+        # When _graphs_baked, CUDA graphs already have the correct weights —
+        # no runtime delta swap needed.
+        need_swap = self._lora_deltas is not None and not self._graphs_baked
+        if need_swap:
+            for param, delta, _mod in self._lora_deltas:
+                param.data.add_(delta)
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        # draft_only: remove LoRA after draft so verify uses base weights.
+        # both: keep LoRA active for verify (removed after verify below).
+        if need_swap and self._lora_mode == "draft_only":
+            for param, delta, _mod in self._lora_deltas:
+                param.data.sub_(delta)
         self._stats_forward_passes += 1
         draft_logits = out.logits_output.full_logits  # [B*bs, V]
 
@@ -195,6 +372,10 @@ class LinearSpec(DllmAlgorithm):
         forward_batch.dllm_causal_kv_update = True
         out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
         forward_batch.dllm_causal_kv_update = False
+        # both mode: remove LoRA after verify (restore base weights).
+        if need_swap and self._lora_mode == "both":
+            for param, delta, _mod in self._lora_deltas:
+                param.data.sub_(delta)
         self._stats_forward_passes += 1
         verify_logits = out.logits_output.full_logits  # [B*bs, V]
         logits_output = out.logits_output
