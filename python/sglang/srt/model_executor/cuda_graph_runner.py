@@ -590,7 +590,6 @@ class CudaGraphRunner:
         self.dllm_config = DllmConfig.from_server_args(model_runner.server_args)
         self.is_dllm = self.dllm_config is not None
         self.dllm_causal = False
-        self.dllm_ar = False
         self.attn_backend = attn_backend or model_runner.attn_backend
         self.speculative_num_steps = (
             model_runner.server_args.speculative_num_steps
@@ -736,16 +735,10 @@ class CudaGraphRunner:
         if forward_batch.replace_embeds is not None:
             return False
 
-        # For DLLM models, only DLLM_EXTEND passes use the CUDA graph —
-        # EXCEPT for AR mode (dllm_ar_mode=True) which uses DECODE graphs.
+        # For DLLM models, only DLLM_EXTEND passes use the CUDA graph.
         # EXTEND (prompt-caching) and other modes fall through to eager.
-        if self.is_dllm:
-            if forward_batch.dllm_ar_mode:
-                # AR mode uses DECODE-mode CUDA graphs (captured alongside DLLM_EXTEND).
-                # Fall through to the normal can_run checks below.
-                pass
-            elif not forward_batch.forward_mode.is_dllm_extend():
-                return False
+        if self.is_dllm and not forward_batch.forward_mode.is_dllm_extend():
+            return False
 
 
         if self.require_mlp_tp_gather:
@@ -912,21 +905,6 @@ class CudaGraphRunner:
                             self.graphs[causal_key] = causal_graph
                             self.output_buffers[causal_key] = causal_output
 
-                            # DLLM AR: capture a DECODE-mode graph when block_size=1.
-                            # This uses the optimized single-token decode attention
-                            # kernel instead of the prefill kernel, giving ~50%
-                            # throughput improvement for AR mode.
-                            if self.num_tokens_per_bs == 1:
-                                ar_graph, ar_output = self.capture_one_batch_size(
-                                    bs, forward, stream_idx, dllm_ar_decode=True
-                                )
-                                ar_key = (
-                                    f"ar_decode_{bs}"
-                                    if stream_idx is None
-                                    else f"ar_decode_{stream_idx}_{bs}"
-                                )
-                                self.graphs[ar_key] = ar_graph
-                                self.output_buffers[ar_key] = ar_output
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -996,7 +974,6 @@ class CudaGraphRunner:
         forward: Callable,
         stream_idx: Optional[int] = None,
         dllm_causal: bool = False,
-        dllm_ar_decode: bool = False,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
@@ -1103,11 +1080,7 @@ class CudaGraphRunner:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
-        # AR DECODE graphs use ForwardMode.DECODE so the optimized single-token
-        # decode attention kernel is captured instead of the prefill kernel.
-        capture_mode = (
-            ForwardMode.DECODE if dllm_ar_decode else self.capture_forward_mode
-        )
+        capture_mode = self.capture_forward_mode
 
         forward_batch = ForwardBatch(
             forward_mode=capture_mode,
@@ -1152,8 +1125,6 @@ class CudaGraphRunner:
 
         if dllm_causal:
             forward_batch.dllm_causal_kv_update = True
-        if dllm_ar_decode:
-            forward_batch.dllm_ar_mode = True
 
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -1321,19 +1292,16 @@ class CudaGraphRunner:
         else:
             attn_backend = self.attn_backend
         dllm_causal = getattr(forward_batch, "dllm_causal_kv_update", False)
-        dllm_ar = getattr(forward_batch, "dllm_ar_mode", False)
         replay_kwargs = {}
         if dllm_causal:
             replay_kwargs["dllm_causal"] = True
-        # AR DECODE graphs were captured with ForwardMode.DECODE — replay with that mode.
-        replay_forward_mode = ForwardMode.DECODE if dllm_ar else self.capture_forward_mode
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
             buffers.seq_lens[:bs],
             forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
             buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            replay_forward_mode,
+            self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
             **replay_kwargs,
@@ -1344,7 +1312,6 @@ class CudaGraphRunner:
         self.raw_num_token = raw_num_token
         self.bs = bs
         self.dllm_causal = dllm_causal
-        self.dllm_ar = dllm_ar
 
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
@@ -1378,13 +1345,11 @@ class CudaGraphRunner:
         graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
         if self.dllm_causal:
             graph_key = f"causal_{graph_key}"
-        elif self.dllm_ar:
-            graph_key = f"ar_decode_{graph_key}"
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
-            if self.is_dllm and not self.dllm_ar:
+            if self.is_dllm:
                 # Standard DLLM (LinearSpec / FastDiffuser): full_logits for all tokens.
                 next_token_logits = None
                 full_logits = (
@@ -1393,7 +1358,7 @@ class CudaGraphRunner:
                     else None
                 )
             else:
-                # Standard DECODE or DLLM AR: next_token_logits per request.
+                # Standard DECODE: next_token_logits per request.
                 full_logits = None
                 next_token_logits = (
                     output.next_token_logits[: self.raw_num_token]

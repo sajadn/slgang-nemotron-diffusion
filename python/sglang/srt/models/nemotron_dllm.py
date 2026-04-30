@@ -427,6 +427,7 @@ class MinistralDiffuserAttention(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        causal: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -483,13 +484,14 @@ class MinistralDiffuserAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
+        attn_type = AttentionType.DECODER if causal else AttentionType.ENCODER_ONLY
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scale,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            attn_type=AttentionType.ENCODER_ONLY,
+            attn_type=attn_type,
             prefix=add_prefix("attn", prefix),
         )
 
@@ -532,11 +534,13 @@ class MinistralDiffuserLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        causal: bool = False,
     ) -> None:
         super().__init__()
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = MinistralDiffuserAttention(
-            config, layer_id, quant_config, prefix=add_prefix("self_attn", prefix)
+            config, layer_id, quant_config, prefix=add_prefix("self_attn", prefix),
+            causal=causal,
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -587,10 +591,11 @@ class MinistralDiffuserModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        causal = getattr(config, "ar_mode", False)
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: MinistralDiffuserLayer(
-                config, idx, quant_config, prefix=prefix
+                config, idx, quant_config, prefix=prefix, causal=causal
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
