@@ -1,0 +1,3 @@
+ar_mix_weight: 0.0
+causal_context: true
+stats_file: /tmp/tidar_stats.jsonl

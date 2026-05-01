@@ -3972,16 +3972,16 @@ class ServerArgs:
             from sglang.srt.dllm.config import DllmConfig
 
             config = DllmConfig.from_server_args(self)
-            # LinearSpec uses partial block acceptance, so it frees
+            # LinearSpec and TiDAR use partial block acceptance, so they free
             # individual slots within a page.  PagedTokenToKVPoolAllocator
             # frees ENTIRE pages when any slot is freed, which corrupts
             # in-use prefix slots sharing the same page.  Use page_size=1
             # for algorithms with partial acceptance to avoid this.
-            partial_accept_algos = {"LinearSpec", "linear_spec"}
+            partial_accept_algos = {"LinearSpec", "linear_spec", "TiDAR", "tidar"}
             if self.dllm_algorithm in partial_accept_algos:
                 if self.page_size != 1:
                     logger.info(
-                        "Setting page size to 1 for LinearSpec (partial block acceptance)"
+                        "Setting page size to 1 for partial-accept DLLM algorithm"
                     )
                     self.page_size = 1
             elif self.page_size % config.block_size != 0:

@@ -307,8 +307,12 @@ class LogitsProcessor(nn.Module):
                 multi_item_delimiter_indices,
             )
 
-        # Diffusion LLM only.
-        if logits_metadata.forward_mode.is_dllm_extend():
+        # Diffusion LLM: return full logits for DLLM_EXTEND and TARGET_VERIFY
+        # (TiDAR uses TARGET_VERIFY with custom_mask for quadratic attention).
+        if logits_metadata.forward_mode.is_dllm_extend() or (
+            self.return_full_logits
+            and logits_metadata.forward_mode.is_target_verify()
+        ):
             return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
 
         # Get the last hidden states and last logits for the next token prediction

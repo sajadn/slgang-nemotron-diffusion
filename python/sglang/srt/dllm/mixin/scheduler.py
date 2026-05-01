@@ -141,6 +141,11 @@ class SchedulerDllmMixin:
 
                 next_token_ids = result.next_token_ids[idx].tolist()
                 new_tokens = len(next_token_ids)
+                # TiDAR manages its own KV slots (frees rejected slots inside
+                # run()). LinearSpec does not free rejected slots, so the
+                # scheduler must do it. Use this flag to avoid double-free.
+                tidar_manages_kv = self.dllm_config.algorithm in ("TiDAR", "tidar")
+
                 if new_tokens == 0:
                     # Free the entire allocated block to prevent kv_committed_len
                     # inflation. Without this, cache_finished_req frees only
@@ -149,10 +154,11 @@ class SchedulerDllmMixin:
                     rejected = self.dllm_config.block_size
                     free_start = req.kv_committed_len - rejected
                     free_end = req.kv_committed_len
-                    free_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, free_start:free_end
-                    ]
-                    self.token_to_kv_pool_allocator.free(free_indices)
+                    if not tidar_manages_kv:
+                        free_indices = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, free_start:free_end
+                        ]
+                        self.token_to_kv_pool_allocator.free(free_indices)
                     req.kv_committed_len = free_start
                     req.kv_allocated_len = free_start
                     continue
@@ -166,10 +172,15 @@ class SchedulerDllmMixin:
                     rejected = self.dllm_config.block_size - new_tokens
                     free_start = req.kv_committed_len - rejected
                     free_end = req.kv_committed_len
-                    free_indices = self.req_to_token_pool.req_to_token[
-                        req.req_pool_idx, free_start:free_end
-                    ]
-                    self.token_to_kv_pool_allocator.free(free_indices)
+                    if not tidar_manages_kv:
+                        # LinearSpec: free the slots rejected by partial-block
+                        # acceptance; TiDAR already freed them in run().
+                        free_indices = self.req_to_token_pool.req_to_token[
+                            req.req_pool_idx, free_start:free_end
+                        ]
+                        self.token_to_kv_pool_allocator.free(free_indices)
+                    # Always update kv_committed_len so release_kv_cache doesn't
+                    # re-read the stale r2t entries beyond the accepted range.
                     req.kv_committed_len = free_start
                     req.kv_allocated_len = free_start
 

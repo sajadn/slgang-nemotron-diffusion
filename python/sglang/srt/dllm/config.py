@@ -78,6 +78,16 @@ class DllmConfig:
         # Compute max_running_requests after YAML config so block_size is final
         if server_args.max_running_requests is not None:
             max_running_requests = server_args.max_running_requests
+        elif server_args.dllm_algorithm == "TiDAR":
+            # Compute from buffer constraints: max_num_token // B
+            B = block_size * (block_size + 1)
+            cg_max_bs = (
+                max(server_args.cuda_graph_bs)
+                if server_args.cuda_graph_bs
+                else 128
+            )
+            max_num_token = cg_max_bs * block_size
+            max_running_requests = max(1, max_num_token // B)
         else:
             max_running_requests = 1
 

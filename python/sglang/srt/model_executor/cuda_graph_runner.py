@@ -601,6 +601,17 @@ class CudaGraphRunner:
             if speculative_num_draft_tokens is None
             else speculative_num_draft_tokens
         )
+        self.is_tidar_replay = False
+
+        # TiDAR: self-speculation uses TARGET_VERIFY with B = block_size*(block_size+1) tokens
+        self.tidar_enabled = (
+            self.is_dllm and self.dllm_config.algorithm == "TiDAR"
+        )
+        self.tidar_B = (
+            self.dllm_config.block_size * (self.dllm_config.block_size + 1)
+            if self.tidar_enabled
+            else 0
+        )
 
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -631,6 +642,21 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        if self.tidar_enabled:
+            # Quadratic decode at bs=1 needs tidar_B tokens; ensure the shared
+            # buffers (input_ids, out_cache_loc, etc.) are large enough even when
+            # max_running_requests=1 compresses capture_bs down to [1].
+            self.max_num_token = max(self.max_num_token, self.tidar_B)
+        # Max TiDAR batch size limited by shared buffer sizing
+        self.max_tidar_bs = (
+            self.max_num_token // self.tidar_B if self.tidar_enabled else 0
+        )
+        if self.tidar_enabled:
+            log_info_on_rank0(
+                logger,
+                f"TiDAR CG: max_tidar_bs={self.max_tidar_bs} "
+                f"(max_num_token={self.max_num_token}, tidar_B={self.tidar_B})",
+            )
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
         # Init PDMux if needed
@@ -735,10 +761,17 @@ class CudaGraphRunner:
         if forward_batch.replace_embeds is not None:
             return False
 
-        # For DLLM models, only DLLM_EXTEND passes use the CUDA graph.
-        # EXTEND (prompt-caching) and other modes fall through to eager.
+        # For DLLM models, only DLLM_EXTEND passes use the CUDA graph,
+        # plus TiDAR TARGET_VERIFY (quadratic decode) for bs<=max_tidar_bs.
         if self.is_dllm and not forward_batch.forward_mode.is_dllm_extend():
-            return False
+            if (
+                self.tidar_enabled
+                and forward_batch.forward_mode.is_target_verify()
+                and forward_batch.batch_size <= self.max_tidar_bs
+            ):
+                pass  # allow TiDAR quadratic decode CG
+            else:
+                return False
 
 
         if self.require_mlp_tp_gather:
@@ -906,6 +939,32 @@ class CudaGraphRunner:
                             self.output_buffers[causal_key] = causal_output
 
 
+                # TiDAR: capture a third graph for TARGET_VERIFY
+                # (quadratic decode, up to max_tidar_bs).
+                # Done outside the main patch_model context to ensure clean state.
+                if self.tidar_enabled and bs <= self.max_tidar_bs:
+                    with patch_model(
+                        self.model_runner.model,
+                        False,  # no torch.compile for TiDAR
+                        num_tokens=bs * self.tidar_B,
+                        tp_group=self.model_runner.tp_group,
+                    ) as tidar_forward:
+                        tidar_graph, tidar_output = (
+                            self.capture_one_batch_size(
+                                bs,
+                                tidar_forward,
+                                stream_idx,
+                                tidar=True,
+                            )
+                        )
+                    tidar_key = (
+                        f"tidar_{bs}"
+                        if stream_idx is None
+                        else f"tidar_{stream_idx}_{bs}"
+                    )
+                    self.graphs[tidar_key] = tidar_graph
+                    self.output_buffers[tidar_key] = tidar_output
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -974,11 +1033,14 @@ class CudaGraphRunner:
         forward: Callable,
         stream_idx: Optional[int] = None,
         dllm_causal: bool = False,
+        tidar: bool = False,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
         stream = self.stream
-        num_tokens = bs * self.num_tokens_per_bs
+        num_tokens = (
+            bs * self.tidar_B if tidar else bs * self.num_tokens_per_bs
+        )
 
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
@@ -1049,7 +1111,10 @@ class CudaGraphRunner:
         else:
             global_dp_buffer_len = None
 
-        spec_info = self.get_spec_info(num_tokens)
+        if tidar:
+            spec_info = self._get_tidar_spec_info(num_tokens, bs, seq_lens)
+        else:
+            spec_info = self.get_spec_info(num_tokens)
         if self.capture_hidden_mode != CaptureHiddenMode.FULL:
             self.capture_hidden_mode = (
                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
@@ -1080,10 +1145,11 @@ class CudaGraphRunner:
             assert self.enable_pdmux
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
 
-        capture_mode = self.capture_forward_mode
-
+        capture_fwd_mode = (
+            ForwardMode.TARGET_VERIFY if tidar else self.capture_forward_mode
+        )
         forward_batch = ForwardBatch(
-            forward_mode=capture_mode,
+            forward_mode=capture_fwd_mode,
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
@@ -1111,7 +1177,7 @@ class CudaGraphRunner:
             spec_info=spec_info,
             capture_hidden_mode=self.capture_hidden_mode,
             num_token_non_padded=buffers.num_token_non_padded,
-            global_forward_mode=capture_mode,
+            global_forward_mode=capture_fwd_mode,
             lora_ids=lora_ids,
         )
 
@@ -1125,6 +1191,9 @@ class CudaGraphRunner:
 
         if dllm_causal:
             forward_batch.dllm_causal_kv_update = True
+        if tidar:
+            # TiDAR TARGET_VERIFY: prevent post_forward_mlp_sync crash
+            forward_batch.global_num_tokens_cpu = None
 
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -1135,6 +1204,8 @@ class CudaGraphRunner:
         capture_kwargs = {}
         if dllm_causal:
             capture_kwargs["dllm_causal"] = True
+        if tidar:
+            capture_kwargs["tidar"] = True
         attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
@@ -1237,14 +1308,23 @@ class CudaGraphRunner:
         buffers = self.buffers
         self.recapture_if_needed(forward_batch)
 
+        # Detect TiDAR quadratic decode replay
+        self.is_tidar_replay = (
+            self.tidar_enabled
+            and forward_batch.forward_mode.is_target_verify()
+        )
+
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        num_tokens_per_bs = (
+            self.tidar_B if self.is_tidar_replay else self.num_tokens_per_bs
+        )
+        raw_num_token = raw_bs * num_tokens_per_bs
 
         # Pad
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
+                max_num_tokens / num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
                 or self.model_runner.spec_algorithm.is_dflash()
@@ -1262,7 +1342,7 @@ class CudaGraphRunner:
             bs=bs,
             seq_len_fill_value=self.seq_len_fill_value,
             require_gathered_buffer=self.require_gathered_buffer,
-            num_tokens_per_bs=self.num_tokens_per_bs,
+            num_tokens_per_bs=num_tokens_per_bs,
             nsa_enable_prefill_cp=self.nsa_enable_prefill_cp,
             enable_num_token_non_padded_flag=enable_num_token_non_padded(
                 self.model_runner.server_args
@@ -1295,13 +1375,20 @@ class CudaGraphRunner:
         replay_kwargs = {}
         if dllm_causal:
             replay_kwargs["dllm_causal"] = True
+        if self.is_tidar_replay:
+            replay_kwargs["tidar"] = True
+        replay_forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if self.is_tidar_replay
+            else self.capture_forward_mode
+        )
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
             buffers.seq_lens[:bs],
             forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
             buffers.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
+            replay_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
             **replay_kwargs,
@@ -1343,7 +1430,9 @@ class CudaGraphRunner:
         variant_label = self._resolve_lora_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
-        if self.dllm_causal:
+        if self.is_tidar_replay:
+            graph_key = f"tidar_{graph_key}"
+        elif self.dllm_causal:
             graph_key = f"causal_{graph_key}"
         self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
@@ -1446,6 +1535,59 @@ class CudaGraphRunner:
                 draft_token_num=self.num_tokens_per_bs,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+        return spec_info
+
+    def _get_tidar_spec_info(
+        self, num_tokens: int, bs: int, seq_lens: torch.Tensor
+    ):
+        """Build a TiDARInput for CUDA graph capture with dummy mask/positions."""
+        from sglang.srt.dllm.algorithm.tidar_input import TiDARInput
+        from sglang.srt.dllm.algorithm.tidar_utils import (
+            build_tidar_positions_and_mask_decode,
+        )
+
+        block_size = self.dllm_config.block_size
+        device = seq_lens.device
+
+        # Use grid-saturation prefix for mask building (must match FlashInfer
+        # capture which also uses 8192). The mask structure depends on prefix
+        # length, so they must be consistent.
+        _GRID_SATURATION_PREFIX = 8192
+        max_pool_len = (
+            self.model_runner.req_to_token_pool.req_to_token.shape[1]
+        )
+        capture_prefix_len = min(
+            _GRID_SATURATION_PREFIX, max_pool_len - self.tidar_B
+        )
+        capture_prefix = torch.full(
+            (bs,), capture_prefix_len, dtype=torch.int32
+        )
+
+        # Build dummy draft tokens (content doesn't matter for capture)
+        dummy_draft = torch.zeros(
+            bs * block_size, dtype=torch.int32, device=device
+        )
+
+        # Build positions and mask
+        draft_token_input, positions, custom_mask = (
+            build_tidar_positions_and_mask_decode(
+                seq_lens=capture_prefix,
+                block_size=block_size,
+                prev_draft_tokens=dummy_draft,
+                mask_token_id=self.dllm_config.mask_id,
+                device=device,
+            )
+        )
+
+        spec_info = TiDARInput(
+            draft_token=draft_token_input,
+            positions=positions,
+            custom_mask=custom_mask,
+            num_queries=self.tidar_B,
+        )
+        spec_info.seq_lens_cpu = capture_prefix.clone()
+        spec_info.seq_lens_sum = int(capture_prefix.sum().item())
 
         return spec_info
 

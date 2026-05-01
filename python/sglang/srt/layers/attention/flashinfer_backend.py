@@ -576,6 +576,7 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         dllm_causal: bool = False,
+        tidar: bool = False,
     ):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
@@ -644,19 +645,57 @@ class FlashInferAttnBackend(AttentionBackend):
                         **wrapper_kwargs,
                     )
                 )
-            seq_lens_sum = seq_lens.sum().item()
-            self.indices_updater_prefill.update(
-                req_pool_indices,
-                seq_lens,
-                seq_lens.cpu(),  # may add a little overhead in capture stage
-                seq_lens_sum,
-                prefix_lens=None,
-                prefill_wrappers=prefill_wrappers,
-                use_ragged=False,
-                encoder_lens=encoder_lens,
-                spec_info=spec_info,
-            )
-            self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
+            if tidar:
+                # TiDAR TARGET_VERIFY: use grid-saturation prefix (same as
+                # DLLM_EXTEND) and disable_split_kv to prevent workspace
+                # mismatch between capture and replay.
+                # seq_lens = prefix only (generate_attn_arg_prefill adds B)
+                tidar_B = self.dllm_config.block_size * (
+                    self.dllm_config.block_size + 1
+                )
+                max_pool_len = (
+                    self.indices_updater_prefill.req_to_token.shape[1]
+                )
+                _GRID_SATURATION_PREFIX = 8192
+                capture_prefix_len = min(
+                    _GRID_SATURATION_PREFIX, max_pool_len - tidar_B
+                )
+                capture_seq_lens = torch.full(
+                    seq_lens.shape,
+                    capture_prefix_len,
+                    dtype=seq_lens.dtype,
+                    device=seq_lens.device,
+                )
+                seq_lens_sum = capture_seq_lens.sum().item()
+                self.indices_updater_prefill.update(
+                    req_pool_indices,
+                    capture_seq_lens,
+                    capture_seq_lens.cpu(),
+                    seq_lens_sum,
+                    prefix_lens=None,
+                    prefill_wrappers=prefill_wrappers,
+                    use_ragged=False,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                    disable_split_kv=True,
+                )
+                self.prefill_cuda_graph_metadata[f"tidar_{bs}"] = (
+                    prefill_wrappers
+                )
+            else:
+                seq_lens_sum = seq_lens.sum().item()
+                self.indices_updater_prefill.update(
+                    req_pool_indices,
+                    seq_lens,
+                    seq_lens.cpu(),  # may add a little overhead in capture stage
+                    seq_lens_sum,
+                    prefix_lens=None,
+                    prefill_wrappers=prefill_wrappers,
+                    use_ragged=False,
+                    encoder_lens=encoder_lens,
+                    spec_info=spec_info,
+                )
+                self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
             self.forward_metadata = PrefillMetadata(prefill_wrappers, False, False)
         elif forward_mode.is_draft_extend():
             prefill_wrappers = []
@@ -765,6 +804,7 @@ class FlashInferAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         dllm_causal: bool = False,
+        tidar: bool = False,
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -779,16 +819,18 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=self.disable_cuda_graph_kv_split,
             )
         elif forward_mode.is_target_verify():
+            metadata_key = f"tidar_{bs}" if tidar else bs
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
                 seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
                 seq_lens_sum,
                 prefix_lens=None,
-                prefill_wrappers=self.prefill_cuda_graph_metadata[bs],
+                prefill_wrappers=self.prefill_cuda_graph_metadata[metadata_key],
                 use_ragged=False,
                 encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
                 spec_info=spec_info,
+                disable_split_kv=tidar,
             )
         elif forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
