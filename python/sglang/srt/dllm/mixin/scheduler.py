@@ -167,6 +167,31 @@ class SchedulerDllmMixin:
                 self.num_generated_tokens += new_tokens
 
                 req.output_ids.extend(next_token_ids)
+                output_logprobs = result.logits_output.next_token_logprobs
+                if req.return_logprob and output_logprobs is not None:
+                    token_logprobs = output_logprobs[idx]
+                    if len(token_logprobs) != new_tokens:
+                        raise RuntimeError(
+                            "DLLM output logprob length mismatch: "
+                            f"got {len(token_logprobs)} logprobs for "
+                            f"{new_tokens} tokens"
+                        )
+                    req.output_token_logprobs_val.extend(token_logprobs)
+                    req.output_token_logprobs_idx.extend(next_token_ids)
+                    if req.top_logprobs_num > 0:
+                        req.output_top_logprobs_val.extend(
+                            [[] for _ in range(new_tokens)]
+                        )
+                        req.output_top_logprobs_idx.extend(
+                            [[] for _ in range(new_tokens)]
+                        )
+                    if req.token_ids_logprob is not None:
+                        req.output_token_ids_logprobs_val.extend(
+                            [[] for _ in range(new_tokens)]
+                        )
+                        req.output_token_ids_logprobs_idx.extend(
+                            [[] for _ in range(new_tokens)]
+                        )
 
                 if new_tokens < self.dllm_config.block_size:
                     rejected = self.dllm_config.block_size - new_tokens

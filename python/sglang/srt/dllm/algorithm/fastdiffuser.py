@@ -118,6 +118,12 @@ class FastDiffuser(DllmAlgorithm):
         # specified; can be overridden via dllm_algorithm_config.max_steps)
         self.max_steps: int = config.max_steps
         self.causal_context: bool = config.causal_context
+        self.selection_policy: str = cfg.get("selection_policy", "confidence")
+        if self.selection_policy not in ("confidence", "leftmost"):
+            raise ValueError(
+                "FastDiffuser selection_policy must be one of "
+                f"'confidence' or 'leftmost', got {self.selection_policy!r}"
+            )
         # Fixed token budget per denoising step (disabled by default).
         # When set, overrides threshold/schedule and commits exactly this many
         # tokens per step (capped at remaining masked tokens).  Useful for
@@ -137,11 +143,12 @@ class FastDiffuser(DllmAlgorithm):
 
         logger.info(
             "FastDiffuser: block_size=%d  max_steps=%d  temperature=%s  "
-            "threshold=%s",
+            "threshold=%s selection_policy=%s",
             self.block_size,
             self.max_steps,
             self.temperature,
             self.threshold,
+            self.selection_policy,
         )
 
     # ------------------------------------------------------------------
@@ -217,6 +224,54 @@ class FastDiffuser(DllmAlgorithm):
         confidence = torch.where(active, x0_p, torch.full_like(x0_p, -np.inf))
 
         return x0, confidence
+
+    def _select_transfer_indices(
+        self,
+        confidence: torch.Tensor,
+        block_mask: torch.Tensor,
+        eos_freeze: torch.Tensor,
+        k: int,
+    ) -> torch.Tensor:
+        """Select masked positions to commit for the current denoising step."""
+        if k <= 0:
+            return torch.empty(0, dtype=torch.long, device=block_mask.device)
+
+        if self.selection_policy == "confidence":
+            _, top_idx = torch.topk(confidence, k=k)
+            return top_idx
+
+        active = block_mask & ~eos_freeze
+        return active.nonzero(as_tuple=True)[0][:k]
+
+    def _record_token_logprobs(
+        self,
+        logprob_grid: Optional[torch.Tensor],
+        batch_idx: int,
+        positions: torch.Tensor,
+        logits: torch.Tensor,
+        token_ids: torch.Tensor,
+    ) -> None:
+        """Store policy logprobs for tokens committed by the denoising step.
+
+        Logprobs are computed as ``log P(token | state, token != mask_id)`` —
+        the mask_id column is removed from the softmax denominator so the
+        reported value reflects the distribution the model actually emits
+        from (mask_id is structurally excluded from the output vocabulary by
+        the reveal/force-commit argmax). Keeps reveal, EOS-propagation, and
+        force-commit paths consistent.
+        """
+        if logprob_grid is None or positions.numel() == 0:
+            return
+        # Fancy-indexing on the first dim returns a copy, so this mutation
+        # is local and does not touch the caller's logits buffer.
+        logits_slice = logits[positions]
+        logits_slice[:, self.mask_id] = -np.inf
+        logprobs = F.log_softmax(logits_slice, dim=-1)
+        token_logprobs = logprobs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
+        logprob_grid[batch_idx, positions] = token_logprobs.to(logprob_grid.dtype)
+
+    def _should_return_token_logprobs(self, forward_batch: ForwardBatch) -> bool:
+        return forward_batch.return_logprob and self.selection_policy == "leftmost"
 
     def _compact_forward_batch(
         self,
@@ -333,6 +388,20 @@ class FastDiffuser(DllmAlgorithm):
 
         # finished[b] = True once request b has no remaining mask tokens
         finished = [False] * batch_size
+        # The chosen-token logprob is a clean policy logprob only for leftmost
+        # reveal: exactly one deterministic position is revealed from the current
+        # denoising state.  Confidence-based reveal has a more complex selection
+        # event, so do not expose this denoising-step score as an API logprob.
+        output_logprob_grid = (
+            torch.full(
+                (batch_size, self.block_size),
+                float("nan"),
+                dtype=torch.float32,
+                device=forward_batch.input_ids.device,
+            )
+            if self._should_return_token_logprobs(forward_batch)
+            else None
+        )
 
         # ----------------------------------------------------------------
         # Iterative denoising loop
@@ -406,7 +475,11 @@ class FastDiffuser(DllmAlgorithm):
                 )
 
                 # How many tokens to place this step
-                remaining = int(block_mask.sum())
+                active_mask = block_mask & ~eos_freeze
+                remaining = int(active_mask.sum())
+                if remaining == 0:
+                    finished[orig_b] = True
+                    continue
 
                 if self.threshold is not None:
                     # HF-matching mode (mirrors get_transfer_index in chat_utils.py):
@@ -421,8 +494,17 @@ class FastDiffuser(DllmAlgorithm):
 
                 k = min(k, remaining)
 
-                # Select top-k by confidence and place them
-                _, top_idx = torch.topk(confidence, k=k)
+                # Select positions according to the configured reveal policy.
+                top_idx = self._select_transfer_indices(
+                    confidence, block_mask, eos_freeze, k
+                )
+                self._record_token_logprobs(
+                    output_logprob_grid,
+                    orig_b,
+                    top_idx,
+                    block_logits,
+                    x0[top_idx],
+                )
                 block_ids[top_idx] = x0[top_idx]
 
                 # EOS propagation: if EOS was just placed in the generated region,
@@ -434,6 +516,20 @@ class FastDiffuser(DllmAlgorithm):
                         if len(gen_eos):
                             first_eos = gen_start + int(gen_eos[0])
                             still_mask = block_ids[first_eos:] == self.mask_id
+                            if still_mask.any():
+                                propagated_idx = (
+                                    still_mask.nonzero(as_tuple=True)[0] + first_eos
+                                )
+                                propagated_token_ids = torch.full_like(
+                                    propagated_idx, eos_id
+                                )
+                                self._record_token_logprobs(
+                                    output_logprob_grid,
+                                    orig_b,
+                                    propagated_idx,
+                                    block_logits,
+                                    propagated_token_ids,
+                                )
                             block_ids[first_eos:][still_mask] = eos_id
 
                 # Check if this request is now fully committed
@@ -483,6 +579,14 @@ class FastDiffuser(DllmAlgorithm):
                 if eos_placed.any():
                     first_eos = int(eos_placed.nonzero(as_tuple=True)[0][0])
                     remaining_mask[first_eos:] = False
+            commit_idx = remaining_mask.nonzero(as_tuple=True)[0]
+            self._record_token_logprobs(
+                output_logprob_grid,
+                b,
+                commit_idx,
+                block_logits,
+                x0_final[commit_idx],
+            )
             block_ids[remaining_mask] = x0_final[remaining_mask]
 
         # ----------------------------------------------------------------
@@ -492,6 +596,33 @@ class FastDiffuser(DllmAlgorithm):
         next_token_ids_list = [
             token_grid[b, start_list[b]:] for b in range(batch_size)
         ]
+        next_token_logprobs_list = None
+        if output_logprob_grid is not None:
+            # In normal denoising every returned generated token was either
+            # committed during a reveal step or force-committed above.  If a
+            # future path leaves a gap, use the final forward as a best-effort
+            # estimate so the API still returns one logprob per output token.
+            for b in range(batch_size):
+                missing_idx = (
+                    torch.isnan(output_logprob_grid[b, start_list[b]:])
+                    .nonzero(as_tuple=True)[0]
+                    + start_list[b]
+                )
+                if missing_idx.numel() == 0:
+                    continue
+                bs_o = b * self.block_size
+                token_ids = token_grid[b, missing_idx]
+                self._record_token_logprobs(
+                    output_logprob_grid,
+                    b,
+                    missing_idx,
+                    logits_output.full_logits[bs_o:bs_o + self.block_size],
+                    token_ids,
+                )
+            next_token_logprobs_list = [
+                output_logprob_grid[b, start_list[b]:].detach().cpu().tolist()
+                for b in range(batch_size)
+            ]
 
         # ----------------------------------------------------------------
         # Write per-request efficiency stats (if stats_file is configured)
@@ -521,6 +652,8 @@ class FastDiffuser(DllmAlgorithm):
             self._stats_eager,
             self._stats_forward_passes,
         )
+        if next_token_logprobs_list is not None:
+            logits_output.next_token_logprobs = next_token_logprobs_list
         return logits_output, next_token_ids_list, can_run_graph
 
 
