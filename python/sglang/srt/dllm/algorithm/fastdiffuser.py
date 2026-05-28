@@ -124,6 +124,15 @@ class FastDiffuser(DllmAlgorithm):
                 "FastDiffuser selection_policy must be one of "
                 f"'confidence' or 'leftmost', got {self.selection_policy!r}"
             )
+        if self.selection_policy == "leftmost" and self.threshold is not None:
+            raise ValueError(
+                "FastDiffuser: 'threshold' is incompatible with "
+                "selection_policy='leftmost'. Threshold counts globally-confident "
+                "positions, but leftmost reveals positions by index regardless of "
+                "confidence, so the two policies mix incompatible signals. "
+                "Remove 'threshold' (leftmost uses k=1 per step, override via "
+                "tokens_per_step) or use selection_policy='confidence'."
+            )
         # Fixed token budget per denoising step (disabled by default).
         # When set, overrides threshold/schedule and commits exactly this many
         # tokens per step (capped at remaining masked tokens).  Useful for
@@ -481,7 +490,13 @@ class FastDiffuser(DllmAlgorithm):
                     finished[orig_b] = True
                     continue
 
-                if self.threshold is not None:
+                if self.selection_policy == "leftmost":
+                    # Leftmost reveal commits positions by index, not confidence,
+                    # so the per-step budget is independent of the model's scores.
+                    # Default k=1 (canonical one-leftmost-per-step); allow override
+                    # via tokens_per_step for throughput experiments.
+                    k = self.tokens_per_step if self.tokens_per_step is not None else 1
+                elif self.threshold is not None:
                     # HF-matching mode (mirrors get_transfer_index in chat_utils.py):
                     # always commit at least the top-1 token (highest confidence),
                     # plus all other tokens whose confidence >= threshold.
