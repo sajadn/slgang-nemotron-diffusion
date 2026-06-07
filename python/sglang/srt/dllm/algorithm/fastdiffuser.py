@@ -273,14 +273,45 @@ class FastDiffuser(DllmAlgorithm):
             return
         # Fancy-indexing on the first dim returns a copy, so this mutation
         # is local and does not touch the caller's logits buffer.
-        logits_slice = logits[positions]
+        logits_slice = logits[positions].to(torch.float32)
         logits_slice[:, self.mask_id] = -np.inf
         logprobs = F.log_softmax(logits_slice, dim=-1)
         token_logprobs = logprobs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
         logprob_grid[batch_idx, positions] = token_logprobs.to(logprob_grid.dtype)
 
     def _should_return_token_logprobs(self, forward_batch: ForwardBatch) -> bool:
-        return forward_batch.return_logprob and self.selection_policy == "leftmost"
+        return forward_batch.return_logprob
+
+    def _record_logprobs_from_fully_masked_logits(
+        self,
+        logprob_grid: Optional[torch.Tensor],
+        fully_masked_logits: Optional[torch.Tensor],
+        token_grid: torch.Tensor,
+        start_list: List[int],
+    ) -> None:
+        """Store FastDiffuser logprobs from the first fully masked forward.
+
+        These are not denoising-step reveal probabilities. They are the
+        fully masked block scores for the final generated tokens, matching
+        DiffuGRPO's Megatron fully masked logprob pass.
+        """
+        if logprob_grid is None or fully_masked_logits is None:
+            return
+
+        logprob_grid.fill_(float("nan"))
+        device = token_grid.device
+        for b, start in enumerate(start_list):
+            positions = torch.arange(start, self.block_size, device=device)
+            if positions.numel() == 0:
+                continue
+            bs = b * self.block_size
+            self._record_token_logprobs(
+                logprob_grid,
+                b,
+                positions,
+                fully_masked_logits[bs : bs + self.block_size],
+                token_grid[b, positions],
+            )
 
     def _compact_forward_batch(
         self,
@@ -411,6 +442,7 @@ class FastDiffuser(DllmAlgorithm):
             if self._should_return_token_logprobs(forward_batch)
             else None
         )
+        fully_masked_logits = None
 
         # ----------------------------------------------------------------
         # Iterative denoising loop
@@ -444,6 +476,13 @@ class FastDiffuser(DllmAlgorithm):
                 self._stats_cuda_graph += 1
             else:
                 self._stats_eager += 1
+
+            if (
+                step == 0
+                and output_logprob_grid is not None
+                and self.selection_policy == "confidence"
+            ):
+                fully_masked_logits = logits_output.full_logits.detach().clone()
 
             # ---------- per-request token placement ----------
             for compact_i, orig_b in enumerate(active_indices):
@@ -613,10 +652,23 @@ class FastDiffuser(DllmAlgorithm):
         ]
         next_token_logprobs_list = None
         if output_logprob_grid is not None:
+            if self.selection_policy == "confidence":
+                # Confidence reveal selects tokens as a function of the whole
+                # block's scores, so expose the first fully-masked forward as
+                # the rollout logprob for DiffuGRPO comparisons.
+                self._record_logprobs_from_fully_masked_logits(
+                    output_logprob_grid,
+                    fully_masked_logits,
+                    token_grid,
+                    start_list,
+                )
+
             # In normal denoising every returned generated token was either
-            # committed during a reveal step or force-committed above.  If a
-            # future path leaves a gap, use the final forward as a best-effort
-            # estimate so the API still returns one logprob per output token.
+            # scored by the initial fully-masked forward for confidence reveal,
+            # or committed during a reveal/force-commit step for leftmost
+            # reveal. If a future path leaves a gap, use the final forward as a
+            # best-effort estimate so the API still returns one logprob per
+            # output token.
             for b in range(batch_size):
                 missing_idx = (
                     torch.isnan(output_logprob_grid[b, start_list[b]:])
