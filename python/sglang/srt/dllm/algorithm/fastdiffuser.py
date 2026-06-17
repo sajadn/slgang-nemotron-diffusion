@@ -139,6 +139,22 @@ class FastDiffuser(DllmAlgorithm):
         # measuring throughput at different token-commit rates.
         self.tokens_per_step: Optional[int] = cfg.get("tokens_per_step", None)
 
+        # What logprobs to return for confidence reveal:
+        #   "fully_masked" (default): the first fully-masked-block forward (matches
+        #       DiffuGRPO's Megatron fully-masked logprob pass).
+        #   "final_step" (SPG): the reveal-step logprobs (each token scored on the
+        #       forward that committed it) plus a per-token `final_step_revealed`
+        #       mask marking tokens committed at their block's LAST denoising step.
+        #       A request's last forward has exactly those positions masked and the
+        #       rest of the block clean, so Megatron can reproduce that conditioning
+        #       (mask final_step_revealed, keep the rest) for a gen_kl sanity check.
+        self.logprob_mode: str = cfg.get("logprob_mode", "fully_masked")
+        if self.logprob_mode not in ("fully_masked", "final_step"):
+            raise ValueError(
+                "FastDiffuser logprob_mode must be 'fully_masked' or 'final_step', "
+                f"got {self.logprob_mode!r}"
+            )
+
         # EOS token id — read lazily from the hf_config if available
         self._eos_token_id: Optional[int] = None
 
@@ -443,6 +459,19 @@ class FastDiffuser(DllmAlgorithm):
             else None
         )
         fully_masked_logits = None
+        # For logprob_mode == "final_step": record the denoising step at which
+        # each position was committed, so we can mark each block's LAST step.
+        # Force-committed positions (after the loop) use a sentinel >= max_steps.
+        commit_step_grid = (
+            torch.full(
+                (batch_size, self.block_size),
+                -1,
+                dtype=torch.int32,
+                device=forward_batch.input_ids.device,
+            )
+            if (output_logprob_grid is not None and self.logprob_mode == "final_step")
+            else None
+        )
 
         # ----------------------------------------------------------------
         # Iterative denoising loop
@@ -559,6 +588,8 @@ class FastDiffuser(DllmAlgorithm):
                     block_logits,
                     x0[top_idx],
                 )
+                if commit_step_grid is not None:
+                    commit_step_grid[orig_b, top_idx] = step
                 block_ids[top_idx] = x0[top_idx]
 
                 # EOS propagation: if EOS was just placed in the generated region,
@@ -584,6 +615,8 @@ class FastDiffuser(DllmAlgorithm):
                                     block_logits,
                                     propagated_token_ids,
                                 )
+                                if commit_step_grid is not None:
+                                    commit_step_grid[orig_b, propagated_idx] = step
                             block_ids[first_eos:][still_mask] = eos_id
 
                 # Check if this request is now fully committed
@@ -641,6 +674,10 @@ class FastDiffuser(DllmAlgorithm):
                 block_logits,
                 x0_final[commit_idx],
             )
+            if commit_step_grid is not None:
+                # Force-commit happens after the denoising loop on the final
+                # full-batch forward; treat it as the last step (sentinel).
+                commit_step_grid[b, commit_idx] = self.max_steps
             block_ids[remaining_mask] = x0_final[remaining_mask]
 
         # ----------------------------------------------------------------
@@ -652,10 +689,12 @@ class FastDiffuser(DllmAlgorithm):
         ]
         next_token_logprobs_list = None
         if output_logprob_grid is not None:
-            if self.selection_policy == "confidence":
+            if self.selection_policy == "confidence" and self.logprob_mode != "final_step":
                 # Confidence reveal selects tokens as a function of the whole
                 # block's scores, so expose the first fully-masked forward as
                 # the rollout logprob for DiffuGRPO comparisons.
+                # (logprob_mode == "final_step" instead keeps the reveal-step
+                # logprobs already recorded at each commit, for SPG's gen_kl check.)
                 self._record_logprobs_from_fully_masked_logits(
                     output_logprob_grid,
                     fully_masked_logits,
@@ -686,6 +725,24 @@ class FastDiffuser(DllmAlgorithm):
                     logits_output.full_logits[bs_o:bs_o + self.block_size],
                     token_ids,
                 )
+            # final_step mode: keep the reveal-step logprob (<= 0) only for tokens
+            # committed at each block's LAST denoising step; overwrite the rest with
+            # a positive sentinel (+1.0) so the consumer recovers the "final step"
+            # mask from the sign (real logprobs are always <= 0; use a < 0.5 test to
+            # tolerate float noise). No new SGLang output field is needed, and SPG's
+            # loss ignores generation logprobs so overloading this channel is safe.
+            # The request's final forward had exactly the final-step positions masked
+            # (rest of the block clean), so the recorded logprob there is what Megatron
+            # reproduces when it masks them and leaves the rest clean -> SPG gen_kl ~ 0.
+            if commit_step_grid is not None:
+                for b in range(batch_size):
+                    cs = commit_step_grid[b]
+                    committed = cs >= 0
+                    if committed.any():
+                        last = int(cs[committed].max().item())
+                        non_final = committed & (cs != last)
+                        output_logprob_grid[b, non_final] = 1.0  # FINAL_STEP sentinel
+
             next_token_logprobs_list = [
                 output_logprob_grid[b, start_list[b]:].detach().cpu().tolist()
                 for b in range(batch_size)
