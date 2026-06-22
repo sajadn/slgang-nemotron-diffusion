@@ -37,6 +37,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    ReconfigureDllmReqInput,
+    ReconfigureDllmReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetLoadsReqInput,
@@ -108,6 +110,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("reconfigure_dllm", ReconfigureDllmReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -258,6 +261,16 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
+        )[0]
+
+    async def reconfigure_dllm(
+        self: TokenizerManager, overrides: Optional[Dict[str, Any]] = None
+    ) -> ReconfigureDllmReqOutput:
+        self.auto_create_handle_loop()
+        return (
+            await self.reconfigure_dllm_communicator(
+                ReconfigureDllmReqInput(overrides=overrides)
+            )
         )[0]
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:

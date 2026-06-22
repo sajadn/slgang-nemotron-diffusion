@@ -128,6 +128,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     ProfileReqInput,
+    ReconfigureDllmReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -679,6 +680,20 @@ async def get_load():
 async def set_internal_state(obj: SetInternalStateReq, request: Request):
     res = await _global_state.tokenizer_manager.set_internal_state(obj)
     return res
+
+
+@app.post("/reconfigure_dllm")
+async def reconfigure_dllm(obj: ReconfigureDllmReqInput, request: Request):
+    """Reconfigure the live FastDiffuser decoding params at runtime."""
+    ret = await _global_state.tokenizer_manager.reconfigure_dllm(overrides=obj.overrides)
+    return ORJSONResponse(
+        content={
+            "success": ret.success,
+            "previous": ret.previous or {},
+            "message": ret.message,
+        },
+        status_code=200,
+    )
 
 
 # Do not import `dumper.py` to avoid dependency

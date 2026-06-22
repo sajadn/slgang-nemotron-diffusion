@@ -1240,6 +1240,23 @@ class FlushCacheReqOutput(BaseReq):
 
 
 @dataclass
+class ReconfigureDllmReqInput(BaseReq):
+    # Mapping of FastDiffuser attribute name -> new value to apply at runtime
+    # (e.g. {"selection_policy": "confidence", "threshold": 0.9}). Used to make
+    # validation decode under a fixed policy regardless of the rollout policy.
+    overrides: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class ReconfigureDllmReqOutput(BaseReq):
+    success: bool
+    # Previous values of the attributes that were changed, so the caller can
+    # restore the rollout configuration after validation.
+    previous: Optional[Dict[str, Any]] = None
+    message: str = ""
+
+
+@dataclass
 class AddExternalCorpusReqInput(BaseReq):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

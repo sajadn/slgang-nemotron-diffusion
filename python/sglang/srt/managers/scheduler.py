@@ -106,6 +106,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    ReconfigureDllmReqInput,
+    ReconfigureDllmReqOutput,
     FreezeGCReq,
     GetInternalStateReq,
     GetInternalStateReqOutput,
@@ -1282,6 +1284,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                (ReconfigureDllmReqInput, self.reconfigure_dllm),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -3301,6 +3304,63 @@ class Scheduler(
             )
             success = False
         return success
+
+    def reconfigure_dllm(
+        self, recv_req: ReconfigureDllmReqInput
+    ) -> ReconfigureDllmReqOutput:
+        """Mutate the live FastDiffuser decoding params at runtime.
+
+        Used so validation can decode under a fixed policy (e.g. confidence)
+        regardless of the rollout policy. Only soft per-step attributes are
+        allowed; structural params (block_size, etc.) are fixed at launch.
+        """
+        algo = getattr(self.tp_worker, "dllm_algorithm", None)
+        if algo is None:
+            return ReconfigureDllmReqOutput(
+                success=False,
+                previous={},
+                message="DLLM algorithm is not enabled on this server.",
+            )
+        allowed = (
+            "selection_policy",
+            "threshold",
+            "temperature",
+            "max_steps",
+            "tokens_per_step",
+        )
+        overrides = recv_req.overrides or {}
+        # Validate keys AND the resulting combined state BEFORE mutating anything,
+        # so the live FastDiffuser is never left half-reconfigured and `previous`
+        # is always complete. Mirrors FastDiffuser.__init__'s own invariants.
+        for k in overrides:
+            if k not in allowed:
+                return ReconfigureDllmReqOutput(
+                    success=False,
+                    previous={},
+                    message=f"Attribute '{k}' is not runtime-reconfigurable. Allowed: {allowed}",
+                )
+        new_selection = overrides.get("selection_policy", algo.selection_policy)
+        new_threshold = overrides.get("threshold", algo.threshold)
+        if new_selection not in ("confidence", "leftmost"):
+            return ReconfigureDllmReqOutput(
+                success=False,
+                previous={},
+                message=f"selection_policy must be 'confidence' or 'leftmost', got {new_selection!r}",
+            )
+        if new_selection == "leftmost" and new_threshold is not None:
+            return ReconfigureDllmReqOutput(
+                success=False,
+                previous={},
+                message="selection_policy='leftmost' is incompatible with a non-null threshold.",
+            )
+        previous: dict = {}
+        for k, v in overrides.items():
+            previous[k] = getattr(algo, k, None)
+            setattr(algo, k, v)
+        logger.info(
+            f"[DLLM] reconfigured FastDiffuser at runtime: applied={overrides} previous={previous}"
+        )
+        return ReconfigureDllmReqOutput(success=True, previous=previous, message="")
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__
