@@ -101,6 +101,10 @@ class LogitsProcessorOutput:
 
     ## Part 4: Diffusion LLM only.
     full_logits: Optional[torch.Tensor] = None
+    # FastDiffuser logprob_mode="trajectory": per-token block-relative denoising
+    # step (commit_step) that revealed each output token. One list per request,
+    # parallel to next_token_logprobs. None for all other modes.
+    next_token_reveal_steps: Optional[List] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None

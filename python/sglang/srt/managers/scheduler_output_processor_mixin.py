@@ -977,6 +977,7 @@ class SchedulerOutputProcessorMixin:
             input_token_logprobs_idx = []
             output_token_logprobs_val = []
             output_token_logprobs_idx = []
+            output_token_reveal_steps = []
             input_top_logprobs_val = []
             input_top_logprobs_idx = []
             output_top_logprobs_val = []
@@ -995,6 +996,7 @@ class SchedulerOutputProcessorMixin:
             ) = input_token_ids_logprobs_idx = output_token_ids_logprobs_val = (
                 output_token_ids_logprobs_idx
             ) = None
+            output_token_reveal_steps = None
 
         for req in reqs:
             if req is skip_req:
@@ -1134,6 +1136,14 @@ class SchedulerOutputProcessorMixin:
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
+                        if req.output_token_reveal_steps is not None:
+                            output_token_reveal_steps.append(
+                                req.output_token_reveal_steps[
+                                    send_output_token_logprobs_offset:logprob_end
+                                ]
+                            )
+                        else:
+                            output_token_reveal_steps.append([])
                         req.send_output_token_logprobs_offset = logprob_end
                     else:
                         output_token_logprobs_val.append([])
@@ -1142,6 +1152,7 @@ class SchedulerOutputProcessorMixin:
                         output_top_logprobs_idx.append([])
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
+                        output_token_reveal_steps.append([])
 
                 if req.return_hidden_states:
                     if output_hidden_states is None:
@@ -1204,6 +1215,7 @@ class SchedulerOutputProcessorMixin:
                     input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
                     output_token_ids_logprobs_val=output_token_ids_logprobs_val,
                     output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
+                    output_token_reveal_steps=output_token_reveal_steps,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,

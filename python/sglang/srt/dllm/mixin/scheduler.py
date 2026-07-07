@@ -178,6 +178,18 @@ class SchedulerDllmMixin:
                         )
                     req.output_token_logprobs_val.extend(token_logprobs)
                     req.output_token_logprobs_idx.extend(next_token_ids)
+                    # FastDiffuser logprob_mode="trajectory" attaches per-token
+                    # commit steps on the logits_output; extend them in lockstep
+                    # with the logprobs so downstream assembly stays aligned. All
+                    # other modes leave this None (nothing to extend).
+                    reveal_steps = getattr(
+                        result.logits_output, "next_token_reveal_steps", None
+                    )
+                    if (
+                        reveal_steps is not None
+                        and req.output_token_reveal_steps is not None
+                    ):
+                        req.output_token_reveal_steps.extend(reveal_steps[idx])
                     if req.top_logprobs_num > 0:
                         req.output_top_logprobs_val.extend(
                             [[] for _ in range(new_tokens)]

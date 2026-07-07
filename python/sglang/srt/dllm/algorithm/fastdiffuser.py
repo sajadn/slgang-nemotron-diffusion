@@ -148,12 +148,24 @@ class FastDiffuser(DllmAlgorithm):
         #       A request's last forward has exactly those positions masked and the
         #       rest of the block clean, so Megatron can reproduce that conditioning
         #       (mask final_step_revealed, keep the rest) for a gen_kl sanity check.
+        #   "trajectory": the reveal-step logprobs (same as "final_step") but with
+        #       NO sentinel overwrite -- every output token keeps the real logprob
+        #       of the forward that committed it, plus a per-token block-relative
+        #       commit_step returned as next_token_reveal_steps. Used by the
+        #       inference-trajectory-replay ("Trace") JustGRPO baseline to score
+        #       each token on exactly the context inference conditioned on.
         self.logprob_mode: str = cfg.get("logprob_mode", "fully_masked")
-        if self.logprob_mode not in ("fully_masked", "final_step"):
+        if self.logprob_mode not in ("fully_masked", "final_step", "trajectory"):
             raise ValueError(
-                "FastDiffuser logprob_mode must be 'fully_masked' or 'final_step', "
-                f"got {self.logprob_mode!r}"
+                "FastDiffuser logprob_mode must be 'fully_masked', 'final_step' "
+                f"or 'trajectory', got {self.logprob_mode!r}"
             )
+
+        # When True, emit a per-token block-relative commit step
+        # (next_token_reveal_steps) alongside logprobs. Opt-in and independent of
+        # logprob_mode so the step channel is only produced when explicitly
+        # requested (used by the "Trace" trajectory-replay baseline). Default off.
+        self.return_reveal_steps: bool = cfg.get("return_reveal_steps", False)
 
         # EOS token id — read lazily from the hf_config if available
         self._eos_token_id: Optional[int] = None
@@ -168,12 +180,15 @@ class FastDiffuser(DllmAlgorithm):
 
         logger.info(
             "FastDiffuser: block_size=%d  max_steps=%d  temperature=%s  "
-            "threshold=%s selection_policy=%s",
+            "threshold=%s selection_policy=%s logprob_mode=%s "
+            "return_reveal_steps=%s",
             self.block_size,
             self.max_steps,
             self.temperature,
             self.threshold,
             self.selection_policy,
+            self.logprob_mode,
+            self.return_reveal_steps,
         )
 
     # ------------------------------------------------------------------
@@ -469,7 +484,13 @@ class FastDiffuser(DllmAlgorithm):
                 dtype=torch.int32,
                 device=forward_batch.input_ids.device,
             )
-            if (output_logprob_grid is not None and self.logprob_mode == "final_step")
+            if (
+                output_logprob_grid is not None
+                and (
+                    self.logprob_mode in ("final_step", "trajectory")
+                    or self.return_reveal_steps
+                )
+            )
             else None
         )
 
@@ -689,7 +710,7 @@ class FastDiffuser(DllmAlgorithm):
         ]
         next_token_logprobs_list = None
         if output_logprob_grid is not None:
-            if self.selection_policy == "confidence" and self.logprob_mode != "final_step":
+            if self.selection_policy == "confidence" and self.logprob_mode not in ("final_step", "trajectory"):
                 # Confidence reveal selects tokens as a function of the whole
                 # block's scores, so expose the first fully-masked forward as
                 # the rollout logprob for DiffuGRPO comparisons.
@@ -734,7 +755,7 @@ class FastDiffuser(DllmAlgorithm):
             # The request's final forward had exactly the final-step positions masked
             # (rest of the block clean), so the recorded logprob there is what Megatron
             # reproduces when it masks them and leaves the rest clean -> SPG gen_kl ~ 0.
-            if commit_step_grid is not None:
+            if commit_step_grid is not None and self.logprob_mode == "final_step":
                 for b in range(batch_size):
                     cs = commit_step_grid[b]
                     committed = cs >= 0
@@ -747,6 +768,16 @@ class FastDiffuser(DllmAlgorithm):
                 output_logprob_grid[b, start_list[b]:].detach().cpu().tolist()
                 for b in range(batch_size)
             ]
+
+            # Surface the per-token block-relative commit_step so the trainer can
+            # replay the exact reveal-step conditioning. Gated on the explicit
+            # return_reveal_steps flag (independent of logprob_mode), so the step
+            # channel is emitted only when a run opts in.
+            if commit_step_grid is not None and self.return_reveal_steps:
+                logits_output.next_token_reveal_steps = [
+                    commit_step_grid[b, start_list[b]:].detach().cpu().tolist()
+                    for b in range(batch_size)
+                ]
 
         # ----------------------------------------------------------------
         # Write per-request efficiency stats (if stats_file is configured)

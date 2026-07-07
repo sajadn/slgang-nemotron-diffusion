@@ -1126,6 +1126,10 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
 
+    # FastDiffuser logprob_mode="trajectory": per-request list of per-token
+    # block-relative commit steps (raw ints), parallel to output_token_logprobs_val.
+    output_token_reveal_steps: Optional[List[List[int]]] = None
+
 
 @dataclass
 class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
@@ -1188,6 +1192,10 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
 
     # For observability
     time_stats: Optional[List[SchedulerReqTimeStats]] = None
+
+    # FastDiffuser logprob_mode="trajectory": per-request list of per-token
+    # block-relative commit steps (raw ints), parallel to output_token_logprobs_val.
+    output_token_reveal_steps: Optional[List[List[int]]] = None
 
 
 @dataclass
