@@ -329,6 +329,13 @@ class FastDiffuser(DllmAlgorithm):
         # Fancy-indexing on the first dim returns a copy, so this mutation
         # is local and does not touch the caller's logits buffer.
         logits_slice = logits[positions].to(torch.float32)
+        # Score under the SAME tempered distribution the Gumbel sampler draws
+        # from: log_softmax(logits / temperature). Identity at t=1, guarded at
+        # t=0 (greedy has no tempered distribution; validation may reconfigure
+        # temperature to 0 at runtime). Keeps generation logprobs aligned with
+        # a trainer that tempers its logits the same way.
+        if self.temperature > 0:
+            logits_slice = logits_slice / self.temperature
         logits_slice[:, self.mask_id] = -np.inf
         logprobs = F.log_softmax(logits_slice, dim=-1)
         token_logprobs = logprobs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
