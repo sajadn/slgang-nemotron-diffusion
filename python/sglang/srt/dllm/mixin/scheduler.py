@@ -230,6 +230,24 @@ class SchedulerDllmMixin:
                     req.kv_allocated_len = free_start
 
                 req.check_finished(new_accepted_len=new_tokens)
+                # emit_full_blocks (dllm_algorithm_config, opt-in): keep the whole
+                # final block instead of trimming at the first positional EOS, so
+                # trajectory consumers see every token the decoder actually
+                # committed (incl. post-EOS commits under out-of-order reveal).
+                # finished_len also bounds the logprob/reveal-step slices
+                # (logprob_end = len(output_ids_through_stop)), so rounding it up
+                # extends every channel consistently.
+                if (
+                    req.finished()
+                    and req.finished_len is not None
+                    and self.dllm_config.algorithm_config.get(
+                        "emit_full_blocks", False
+                    )
+                ):
+                    bs_ = int(self.dllm_config.block_size)
+                    req.finished_len = min(
+                        -(-req.finished_len // bs_) * bs_, len(req.output_ids)
+                    )
 
                 if req.finished():
                     release_kv_cache(req, self.tree_cache, is_insert=False)

@@ -3341,17 +3341,17 @@ class Scheduler(
                 )
         new_selection = overrides.get("selection_policy", algo.selection_policy)
         new_threshold = overrides.get("threshold", algo.threshold)
-        if new_selection not in ("confidence", "leftmost"):
+        if new_selection not in ("confidence", "leftmost", "random"):
             return ReconfigureDllmReqOutput(
                 success=False,
                 previous={},
-                message=f"selection_policy must be 'confidence' or 'leftmost', got {new_selection!r}",
+                message=f"selection_policy must be 'confidence', 'leftmost' or 'random', got {new_selection!r}",
             )
-        if new_selection == "leftmost" and new_threshold is not None:
+        if new_selection in ("leftmost", "random") and new_threshold is not None:
             return ReconfigureDllmReqOutput(
                 success=False,
                 previous={},
-                message="selection_policy='leftmost' is incompatible with a non-null threshold.",
+                message=f"selection_policy={new_selection!r} is incompatible with a non-null threshold.",
             )
         previous: dict = {}
         for k, v in overrides.items():

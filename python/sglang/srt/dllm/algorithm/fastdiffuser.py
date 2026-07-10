@@ -119,15 +119,15 @@ class FastDiffuser(DllmAlgorithm):
         self.max_steps: int = config.max_steps
         self.causal_context: bool = config.causal_context
         self.selection_policy: str = cfg.get("selection_policy", "confidence")
-        if self.selection_policy not in ("confidence", "leftmost"):
+        if self.selection_policy not in ("confidence", "leftmost", "random"):
             raise ValueError(
                 "FastDiffuser selection_policy must be one of "
-                f"'confidence' or 'leftmost', got {self.selection_policy!r}"
+                f"'confidence', 'leftmost' or 'random', got {self.selection_policy!r}"
             )
-        if self.selection_policy == "leftmost" and self.threshold is not None:
+        if self.selection_policy in ("leftmost", "random") and self.threshold is not None:
             raise ValueError(
                 "FastDiffuser: 'threshold' is incompatible with "
-                "selection_policy='leftmost'. Threshold counts globally-confident "
+                f"selection_policy={self.selection_policy!r}. Threshold counts globally-confident "
                 "positions, but leftmost reveals positions by index regardless of "
                 "confidence, so the two policies mix incompatible signals. "
                 "Remove 'threshold' (leftmost uses k=1 per step, override via "
@@ -173,6 +173,13 @@ class FastDiffuser(DllmAlgorithm):
         self.return_entropy: bool = cfg.get("return_entropy", False)
         # Per-decode entropy grid; set in decode() when return_entropy is on.
         self._entropy_grid = None
+
+        # When True, EOS can only be SAMPLED at a block's final slot (its logit is
+        # clamped to -inf elsewhere), so termination never happens mid-block: no
+        # EOS propagation, no post-EOS commits, responses end exactly on block
+        # boundaries. Sampling-only: recorded logprobs use the raw logits, so the
+        # returned per-token logprobs stay the unconstrained conditional.
+        self.eos_block_end_only: bool = cfg.get("eos_block_end_only", False)
 
         # EOS token id — read lazily from the hf_config if available
         self._eos_token_id: Optional[int] = None
@@ -287,8 +294,18 @@ class FastDiffuser(DllmAlgorithm):
             _, top_idx = torch.topk(confidence, k=k)
             return top_idx
 
-        active = block_mask & ~eos_freeze
-        return active.nonzero(as_tuple=True)[0][:k]
+        active_idx = (block_mask & ~eos_freeze).nonzero(as_tuple=True)[0]
+        if self.selection_policy == "random":
+            # Uniform random reveal order (diffusion-style random masking):
+            # position choice is independent of the model's scores, so the
+            # per-commit logprob recorded for these tokens is an unbiased
+            # policy logprob (unlike confidence selection). k comes from the
+            # even schedule (threshold is forbidden for this policy).
+            perm = torch.randperm(
+                active_idx.numel(), device=active_idx.device
+            )[:k]
+            return active_idx[perm]
+        return active_idx[:k]
 
     def _record_token_logprobs(
         self,
@@ -596,8 +613,14 @@ class FastDiffuser(DllmAlgorithm):
                         first_eos = int(eos_placed.nonzero(as_tuple=True)[0][0])
                         eos_freeze[first_eos:] = True
 
+                sampling_logits = block_logits
+                if self.eos_block_end_only and eos_id is not None:
+                    # Clamp EOS everywhere but the block-final slot (sampling
+                    # only; _record_token_logprobs below still gets block_logits).
+                    sampling_logits = block_logits.clone()
+                    sampling_logits[:-1, eos_id] = -np.inf
                 x0, confidence = self._compute_confidence(
-                    block_logits, block_mask, block_ids, eos_freeze
+                    sampling_logits, block_mask, block_ids, eos_freeze
                 )
 
                 # How many tokens to place this step
@@ -704,7 +727,12 @@ class FastDiffuser(DllmAlgorithm):
                 continue
             block_logits = logits_output.full_logits[bs_o:be_o].clone()
             block_logits[:, self.mask_id] = -np.inf
-            x0_final = torch.argmax(block_logits, dim=-1)
+            if self.eos_block_end_only and eos_id is not None:
+                fc_sampling_logits = block_logits.clone()
+                fc_sampling_logits[:-1, eos_id] = -np.inf
+                x0_final = torch.argmax(fc_sampling_logits, dim=-1)
+            else:
+                x0_final = torch.argmax(block_logits, dim=-1)
             # Respect EOS freeze: don't commit past the first GENERATED EOS.
             # Prompt-portion EOS (positions < gen_start) must not block force-commit.
             if eos_id is not None:
