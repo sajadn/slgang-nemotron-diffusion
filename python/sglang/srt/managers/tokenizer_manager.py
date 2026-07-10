@@ -180,6 +180,8 @@ class ReqState:
     # FastDiffuser logprob_mode="trajectory": per-token block-relative commit steps
     # (raw ints, no detokenization), accumulated in lockstep with output logprobs.
     output_token_reveal_steps: List[int] = dataclasses.field(default_factory=list)
+    # FastDiffuser return_entropy: per-token entropy, parallel to output logprobs.
+    output_token_entropy_val: List[float] = dataclasses.field(default_factory=list)
     input_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
     input_top_logprobs_idx: List[List[int]] = dataclasses.field(default_factory=list)
     output_top_logprobs_val: List[List[float]] = dataclasses.field(default_factory=list)
@@ -1898,6 +1900,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # FastDiffuser logprob_mode="trajectory": expose raw commit steps directly
         # (empty for every other mode, so the key is always present but benign).
         meta_info["output_token_reveal_steps"] = state.output_token_reveal_steps
+        meta_info["output_token_entropy_val"] = state.output_token_entropy_val
 
         # 2. Handle top logprobs
         if top_logprobs_num > 0:
@@ -1987,6 +1990,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if recv_obj.output_token_reveal_steps is not None:
             state.output_token_reveal_steps.extend(
                 recv_obj.output_token_reveal_steps[recv_obj_index]
+            )
+        if recv_obj.output_token_entropy_val is not None:
+            state.output_token_entropy_val.extend(
+                recv_obj.output_token_entropy_val[recv_obj_index]
             )
 
         if top_logprobs_num > 0:

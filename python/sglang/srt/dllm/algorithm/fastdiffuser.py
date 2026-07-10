@@ -166,6 +166,13 @@ class FastDiffuser(DllmAlgorithm):
         # logprob_mode so the step channel is only produced when explicitly
         # requested (used by the "Trace" trajectory-replay baseline). Default off.
         self.return_reveal_steps: bool = cfg.get("return_reveal_steps", False)
+        # return_entropy (opt-in, independent of logprob_mode / reveal steps):
+        # emit per-token entropy H = -sum_v p_v log p_v of the same commit-step
+        # distribution used for the logprob, alongside next_token_logprobs.
+        # Used by the entropy-sparsified "JustGRPO-Fast" trainer. Default off.
+        self.return_entropy: bool = cfg.get("return_entropy", False)
+        # Per-decode entropy grid; set in decode() when return_entropy is on.
+        self._entropy_grid = None
 
         # EOS token id — read lazily from the hf_config if available
         self._eos_token_id: Optional[int] = None
@@ -309,6 +316,15 @@ class FastDiffuser(DllmAlgorithm):
         logprobs = F.log_softmax(logits_slice, dim=-1)
         token_logprobs = logprobs.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
         logprob_grid[batch_idx, positions] = token_logprobs.to(logprob_grid.dtype)
+        if self._entropy_grid is not None:
+            # Entropy of the same masked commit-step distribution. The excluded
+            # mask column contributes 0 * -inf = nan -> replaced with 0.
+            entropy = -torch.nan_to_num(
+                logprobs.exp() * logprobs, nan=0.0
+            ).sum(-1)
+            self._entropy_grid[batch_idx, positions] = entropy.to(
+                self._entropy_grid.dtype
+            )
 
     def _should_return_token_logprobs(self, forward_batch: ForwardBatch) -> bool:
         return forward_batch.return_logprob
@@ -491,6 +507,18 @@ class FastDiffuser(DllmAlgorithm):
                     or self.return_reveal_steps
                 )
             )
+            else None
+        )
+        # Per-token entropy of the commit-step distribution (parallel to the
+        # logprob grid), materialized only when return_entropy is set.
+        self._entropy_grid = (
+            torch.full(
+                (batch_size, self.block_size),
+                float("nan"),
+                dtype=torch.float32,
+                device=forward_batch.input_ids.device,
+            )
+            if (output_logprob_grid is not None and self.return_entropy)
             else None
         )
 
@@ -779,6 +807,14 @@ class FastDiffuser(DllmAlgorithm):
                     for b in range(batch_size)
                 ]
 
+            # Surface per-token entropy aligned to the output tokens (one value
+            # per generated token, same conditioning as the logprob).
+            if self._entropy_grid is not None:
+                logits_output.next_token_entropy = [
+                    self._entropy_grid[b, start_list[b]:].detach().cpu().tolist()
+                    for b in range(batch_size)
+                ]
+
         # ----------------------------------------------------------------
         # Write per-request efficiency stats (if stats_file is configured)
         # ----------------------------------------------------------------
@@ -809,6 +845,7 @@ class FastDiffuser(DllmAlgorithm):
         )
         if next_token_logprobs_list is not None:
             logits_output.next_token_logprobs = next_token_logprobs_list
+        self._entropy_grid = None
         return logits_output, next_token_ids_list, can_run_graph
 
 

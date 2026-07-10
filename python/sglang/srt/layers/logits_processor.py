@@ -105,6 +105,9 @@ class LogitsProcessorOutput:
     # step (commit_step) that revealed each output token. One list per request,
     # parallel to next_token_logprobs. None for all other modes.
     next_token_reveal_steps: Optional[List] = None
+    # FastDiffuser return_entropy: per-token entropy of the commit-step
+    # distribution. One list per request, parallel to next_token_logprobs.
+    next_token_entropy: Optional[List] = None
 
     ## Part 5: Customized Info
     customized_info: Optional[Dict[str, List[Any]]] = None

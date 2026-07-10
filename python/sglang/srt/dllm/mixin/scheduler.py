@@ -190,6 +190,14 @@ class SchedulerDllmMixin:
                         and req.output_token_reveal_steps is not None
                     ):
                         req.output_token_reveal_steps.extend(reveal_steps[idx])
+                    entropy = getattr(
+                        result.logits_output, "next_token_entropy", None
+                    )
+                    if (
+                        entropy is not None
+                        and req.output_token_entropy_val is not None
+                    ):
+                        req.output_token_entropy_val.extend(entropy[idx])
                     if req.top_logprobs_num > 0:
                         req.output_top_logprobs_val.extend(
                             [[] for _ in range(new_tokens)]

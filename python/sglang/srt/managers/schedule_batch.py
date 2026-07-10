@@ -777,6 +777,9 @@ class Req(ReqDllmMixin):
             # FastDiffuser logprob_mode="trajectory": per-token block-relative
             # commit step, parallel to output_token_logprobs_val.
             self.output_token_reveal_steps = []
+            # FastDiffuser return_entropy: per-token entropy, parallel to
+            # output_token_logprobs_val.
+            self.output_token_entropy_val = []
             # shape: (bs, k)
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
@@ -792,6 +795,7 @@ class Req(ReqDllmMixin):
                 self.output_token_ids_logprobs_idx
             ) = None
             self.output_token_reveal_steps = None
+            self.output_token_entropy_val = None
         self.hidden_states: List[List[float]] = []
         self.hidden_states_tensor = None  # Note: use tensor instead of list to transfer hidden_states when PD + MTP
         self.output_topk_p = None
